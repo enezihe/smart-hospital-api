@@ -1,35 +1,33 @@
 # Smart Hospital API
 
-A minimal Flask API is provided. It is intended for demo and course assignment use.
+A small Flask API for an IoT patient-vitals scenario (course assignment).  
+Runs locally with SQLite; exposes REST endpoints for device registration and vital-sign ingestion plus basic read APIs. Includes simple idempotency for reliable POST retries.
+
+---
 
 ## Features
 
-- A health check endpoint is exposed at `/health`.
-- A sample endpoint is exposed at `/patients` that returns a static list.
-- CORS is enabled.
-- Environment variables can be loaded through `.env`.
+- REST endpoints:
+  - **POST** `/api/v1/devices/register` — register a device (issues per-device API key)
+  - **POST** `/api/v1/patients/{patient_id}/vitals` — ingest vital-signs (idempotent)
+  - **GET** `/api/v1/patients/{patient_id}/latest` — latest reading
+  - **GET** `/api/v1/patients/{patient_id}/history` — paged history (`from`,`to`,`page`,`page_size`)
+- Admin utilities (local dev):
+  - **POST** `/admin/init-db` (or `GET ?confirm=yes`) — create tables + seed `p_001`
+  - **GET** `/admin/db-path` — show SQLite file path
+  - **GET** `/admin/routes` — list loaded routes
+- CORS enabled
+- `.env` support for config
+- Idempotency via `Idempotency-Key` header to avoid duplicate inserts
+- Includes `wsgi.py` for production WSGI servers (e.g., gunicorn/Azure)
+
+---
 
 ## Requirements
 
-- Python 3.10+  
-- pip
+- Python **3.9+**
+- `pip`
 
-The dependencies are listed in `requirements.txt`.
+All dependencies are in `requirements.txt`.
 
-## Installation
-
-1. The repository is cloned or downloaded.
-2. A virtual environment is created (optional but recommended).
-3. Dependencies are installed from `requirements.txt`.
-
-Example:
-
-```bash
-# (optional) create and activate virtual env
-python3 -m venv .venv
-source .venv/bin/activate   # on macOS/Linux
-# .venv\Scripts\activate    # on Windows PowerShell
-
-# install deps
-pip install -r requirements.txt
 
