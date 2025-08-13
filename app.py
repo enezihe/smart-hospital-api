@@ -5,25 +5,34 @@ from flask_sqlalchemy import SQLAlchemy
 from datetime import datetime
 from marshmallow import Schema, fields, ValidationError, validate
 from uuid import uuid4
+from typing import Optional
 import os
 
-# Load environment variables from .env file (if available)
+# Load environment variables (if any) from .env
 load_dotenv()
 
-# Create Flask application instance
+# Flask app
 app = Flask(__name__)
 
-# --- DB config (SQLite for local) ---
+# --- Database (SQLite for local development) ---
 app.config["SQLALCHEMY_DATABASE_URI"] = os.getenv("DATABASE_URL", "sqlite:///hospital.db")
 app.config["SQLALCHEMY_TRACK_MODIFICATIONS"] = False
 db = SQLAlchemy(app)
 
-# Enable Cross-Origin Resource Sharing (CORS) for API calls from different domains
+# Allow cross-origin requests during development
 CORS(app)
 
-# -------------------------
-# Models (for local SQLite)
-# -------------------------
+# ---- DEBUG: Log every incoming request (method, path, key headers) ----
+@app.before_request
+def _log_req():
+    print(
+        "REQ:", request.method, request.path,
+        "| CT:", request.headers.get("Content-Type"),
+        "| X-API-Key:", bool(request.headers.get("X-API-Key")),
+        "| Idem:", request.headers.get("Idempotency-Key")
+    )
+
+# ------------------------- MODELS -------------------------
 class Patient(db.Model):
     id = db.Column(db.String, primary_key=True)
     name = db.Column(db.String, nullable=False)
@@ -36,7 +45,7 @@ class Device(db.Model):
     patient_id = db.Column(db.String, db.ForeignKey("patient.id"))
     registered_at = db.Column(db.DateTime, default=datetime.utcnow)
     status = db.Column(db.String, default="active")
-    api_key = db.Column(db.String, nullable=False)  # per-device key (issued at register)
+    api_key = db.Column(db.String, nullable=False)  # per-device API key (issued at register)
 
 class Vital(db.Model):
     id = db.Column(db.String, primary_key=True)
@@ -58,16 +67,14 @@ class Alert(db.Model):
     timestamp = db.Column(db.DateTime, default=datetime.utcnow)
     status = db.Column(db.String, default="NEW")
 
-# NEW: idempotency key store (prevents duplicate POSTs on retry)
+# Prevent duplicate POSTs when clients retry (network flakiness etc.)
 class IdempotencyKey(db.Model):
     id = db.Column(db.Integer, primary_key=True, autoincrement=True)
     device_id = db.Column(db.String, index=True, nullable=False)
     key = db.Column(db.String, unique=True, index=True, nullable=False)  # device_id:idempotency_key
     created_at = db.Column(db.DateTime, default=datetime.utcnow)
 
-# -------------------------
-# Schemas (validation)
-# -------------------------
+# ------------------------- SCHEMAS (validation) -------------------------
 class BPField(Schema):
     systolic = fields.Integer(required=True, validate=validate.Range(min=0, max=300))
     diastolic = fields.Integer(required=True, validate=validate.Range(min=0, max=200))
@@ -82,24 +89,24 @@ class VitalInSchema(Schema):
 
 class DeviceRegisterSchema(Schema):
     device_id = fields.String(required=True)
-    type = fields.String(required=True, validate=validate.OneOf(["hr","bp","spo2","temp","multi"]))
+    type = fields.String(required=True, validate=validate.OneOf(["hr", "bp", "spo2", "temp", "multi"]))
     patient_id = fields.String(required=True)
 
-# -------------------------
-# Helpers / Config
-# -------------------------
+# ------------------------- HELPERS / CONFIG -------------------------
 DEVICE_MASTER_KEY = os.getenv("DEVICE_MASTER_KEY", "dev-master-key-123")
 
 def uid(prefix: str) -> str:
     return f"{prefix}_{uuid4().hex[:12]}"
 
 def error(code: str, http: int, message: str, details=None):
+    """Uniform error payload shape."""
     payload = {"code": code, "message": message}
     if details is not None:
         payload["details"] = details
     return payload, http
 
 def require_device_api_key():
+    """Simple device/master key auth for write operations."""
     supplied = request.headers.get("X-API-Key")
     if not supplied:
         return False, error("missing_api_key", 401, "X-API-Key header required")
@@ -109,7 +116,8 @@ def require_device_api_key():
         return True, None
     return False, error("invalid_api_key", 401, "Invalid API key")
 
-def parse_dt(s):
+def parse_dt(s: Optional[str]) -> Optional[datetime]:
+    """Parse ISO-8601 strings (supports trailing Z)."""
     if not s:
         return None
     try:
@@ -118,10 +126,11 @@ def parse_dt(s):
     except Exception:
         raise ValueError(f"Invalid datetime: {s}")
 
-def record_idempotency(device_id, idem_key):
+
+def record_idempotency(device_id: str, idem_key: Optional[str]) -> bool:
     """
-    Returns True if this (device_id, idem_key) combination has NOT been seen before.
-    Returns False if duplicate; in that case the POST should be ignored gracefully.
+    Return True if (device_id, idem_key) has NOT been seen before (safe to process).
+    Return False if duplicate (should be ignored gracefully).
     If client does not send an idempotency key, treat as new (True).
     """
     if not idem_key:
@@ -133,36 +142,41 @@ def record_idempotency(device_id, idem_key):
     db.session.commit()
     return True
 
-# -------------------------
-# Local-only admin helpers
-# -------------------------
-@app.route("/admin/db-path", methods=["GET"])
+# ------------------------- ADMIN (local utilities) -------------------------
+@app.get("/admin/routes")
+def list_routes():
+    routes = []
+    for rule in app.url_map.iter_rules():
+        routes.append({"rule": str(rule), "methods": sorted(list(rule.methods))})
+    return {"routes": routes}, 200
+
+@app.get("/admin/db-path")
 def db_path():
-    db_file = db.engine.url.database  # may be relative
+    """Show the resolved SQLite file path for troubleshooting."""
+    db_file = db.engine.url.database
     abs_path = os.path.abspath(db_file) if db_file else None
     return {"database_uri": str(db.engine.url), "db_file": db_file, "absolute_path": abs_path}, 200
 
 @app.route("/admin/init-db", methods=["POST", "GET"])
 def init_db():
+    """
+    Initialize tables and seed a demo patient (local only).
+    - POST: initialize immediately.
+    - GET : requires ?confirm=yes to avoid accidental calls.
+    """
     if request.method == "GET" and request.args.get("confirm") != "yes":
         return {"message": "Use POST or call /admin/init-db?confirm=yes (local only)"}, 200
     db.create_all()
     if not Patient.query.get("p_001"):
         db.session.add(Patient(id="p_001", name="Demo Patient"))
         db.session.commit()
-    try:
-        print("SQLite file:", os.path.abspath(db.engine.url.database))
-    except Exception:
-        pass
+    print("SQLite file:", os.path.abspath(db.engine.url.database))
     return {"status": "initialized"}, 201
 
-# -------------------------
-# REST API (assignment endpoints)
-# -------------------------
-
-# Device registration
+# ------------------------- REST API -------------------------
 @app.post("/api/v1/devices/register")
 def register_device():
+    """Register a device and issue a per-device API key."""
     ok, resp = require_device_api_key()
     if not ok:
         return resp
@@ -173,7 +187,7 @@ def register_device():
 
     patient = Patient.query.get(body["patient_id"])
     if not patient:
-        # For local demo: create patient if not exists
+        # For local demo, auto-create the patient if missing
         patient = Patient(id=body["patient_id"], name=f"Patient {body['patient_id']}")
         db.session.add(patient)
 
@@ -188,9 +202,9 @@ def register_device():
     db.session.commit()
     return {"device_id": device.id, "api_key": api_key, "status": "registered"}, 201
 
-# Submit new vital-sign readings (with idempotency)
 @app.post("/api/v1/patients/<patient_id>/vitals")
 def post_vitals(patient_id):
+    """Ingest a vital-sign record; idempotent via Idempotency-Key."""
     ok, resp = require_device_api_key()
     if not ok:
         return resp
@@ -199,7 +213,7 @@ def post_vitals(patient_id):
     except ValidationError as e:
         return error("validation_error", 400, "Invalid payload", e.messages)
 
-    # Idempotency: prefer header, fallback to body field
+    # Idempotency: prefer header, fallback to body
     idem = request.headers.get("Idempotency-Key") or (request.json or {}).get("idempotency_key")
     if not record_idempotency(data["device_id"], idem):
         return {"status": "duplicate_ignored"}, 200
@@ -219,9 +233,9 @@ def post_vitals(patient_id):
     db.session.commit()
     return {"vital_id": v.id, "status": "stored"}, 201
 
-# Get latest vitals for a patient
 @app.get("/api/v1/patients/<patient_id>/latest")
 def get_latest(patient_id):
+    """Return the most recent vital-sign reading for the patient."""
     v = Vital.query.filter_by(patient_id=patient_id).order_by(Vital.timestamp.desc()).first()
     if not v:
         return error("not_found", 404, "No readings for patient")
@@ -237,9 +251,9 @@ def get_latest(patient_id):
         "device_id": v.device_id
     }, 200
 
-# Get historical vitals (with optional filters and paging)
 @app.get("/api/v1/patients/<patient_id>/history")
 def get_history(patient_id):
+    """Paginated historical readings with optional from/to filters."""
     try:
         dt_from = parse_dt(request.args.get("from")) if request.args.get("from") else None
         dt_to   = parse_dt(request.args.get("to")) if request.args.get("to") else None
@@ -271,10 +285,8 @@ def get_history(patient_id):
     except Exception as e:
         return error("bad_request", 400, "Invalid query parameters", str(e))
 
-# -------------------------
-# Existing demo routes (kept)
-# -------------------------
-@app.route("/", methods=["GET"])
+# ------------------------- DEMO & DEBUG -------------------------
+@app.get("/")
 def home():
     return {
         "api_name": "Smart Hospital API",
@@ -284,28 +296,42 @@ def home():
             "/patients",
             "/admin/init-db",
             "/admin/db-path",
+            "/admin/routes",
             "/api/v1/devices/register",
             "/api/v1/patients/{id}/vitals",
             "/api/v1/patients/{id}/latest",
-            "/api/v1/patients/{id}/history"
+            "/api/v1/patients/{id}/history",
+            "/debug/echo"
         ]
     }, 200
 
-@app.route("/health", methods=["GET"])
+@app.get("/health")
 def health_check():
     return {"status": "OK"}, 200
 
-@app.route("/patients", methods=["GET"])
+@app.get("/patients")
 def get_patients():
-    patients = [
+    return {"patients": [
         {"id": 1, "name": "John Doe", "room": 101},
         {"id": 2, "name": "Jane Smith", "room": 102}
-    ]
-    return {"patients": patients}, 200
+    ]}, 200
 
-# -------------------------
-# Entrypoint (local dev)
-# -------------------------
+@app.route("/debug/echo", methods=["GET", "POST", "PUT", "DELETE", "PATCH", "HEAD", "OPTIONS"])
+def echo():
+    """Utility endpoint that echoes request method, headers, and JSON body (for debugging)."""
+    return {
+        "method": request.method,
+        "path": request.path,
+        "headers": {
+            "Content-Type": request.headers.get("Content-Type"),
+            "X-API-Key": request.headers.get("X-API-Key"),
+            "Idempotency-Key": request.headers.get("Idempotency-Key")
+        },
+        "body": request.get_json(silent=True)
+    }, 200
+
+# ------------------------- ENTRY POINT -------------------------
 if __name__ == "__main__":
+    print("Starting Smart Hospital API from:", os.path.abspath(__file__))
     port = int(os.getenv("PORT", 8000))
     app.run(host="0.0.0.0", port=port, debug=True)
