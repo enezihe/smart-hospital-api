@@ -176,7 +176,6 @@ def init_db():
 # ------------------------- REST API -------------------------
 @app.post("/api/v1/devices/register")
 def register_device():
-    """Register a device and issue a per-device API key."""
     ok, resp = require_device_api_key()
     if not ok:
         return resp
@@ -185,11 +184,20 @@ def register_device():
     except ValidationError as e:
         return error("validation_error", 400, "Invalid payload", e.messages)
 
+    # if patient doesn't exist, create (local convenience)
     patient = Patient.query.get(body["patient_id"])
     if not patient:
-        # For local demo, auto-create the patient if missing
         patient = Patient(id=body["patient_id"], name=f"Patient {body['patient_id']}")
         db.session.add(patient)
+
+    #  idempotent-ish: same device_id -> return existing
+    existing = Device.query.get(body["device_id"])
+    if existing:
+        return {
+            "device_id": existing.id,
+            "api_key": existing.api_key,
+            "status": "already_registered"
+        }, 200
 
     api_key = uid("key")
     device = Device(
@@ -201,6 +209,7 @@ def register_device():
     db.session.add(device)
     db.session.commit()
     return {"device_id": device.id, "api_key": api_key, "status": "registered"}, 201
+
 
 @app.post("/api/v1/patients/<patient_id>/vitals")
 def post_vitals(patient_id):
