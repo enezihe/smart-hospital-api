@@ -1,6 +1,6 @@
 # Smart Hospital API
 
-A small Flask API for an IoT patient-vitals scenario (course assignment).  
+A small Flask API for an IoT patient-vitals scenario.  
 Runs locally with SQLite; exposes REST endpoints for device registration and vital-sign ingestion plus basic read APIs. Includes simple idempotency for reliable POST retries.
 
 ---
